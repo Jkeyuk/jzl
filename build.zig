@@ -21,4 +21,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_mod_tests.addArgs(args);
     }
+
+    const check_step = b.step("check", "Check if project and tests compile");
+    check_step.dependOn(&run_mod_tests.step);
 }
