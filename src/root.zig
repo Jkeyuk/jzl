@@ -3,4 +3,5 @@ const std = @import("std");
 
 test  {
     _  = @import("text_wrap.zig");
+    _  = @import("tree.zig");
 }
