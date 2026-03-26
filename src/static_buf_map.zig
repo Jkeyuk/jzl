@@ -17,96 +17,109 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
             @compileError("CAPACITY must be a power of 2");
     }
 
-    const Entry = struct { value: V, hash: u64 };
-
     return struct {
         const Self = @This();
         const MASK = CAPACITY - 1;
 
-        entries: [CAPACITY]Entry = undefined,
+        hashes: [CAPACITY]u64 = undefined,
+        values: [CAPACITY]V = undefined,
         used_mask: std.StaticBitSet(CAPACITY) = .initEmpty(),
-        tombstone_mask: std.StaticBitSet(CAPACITY) = .initEmpty(),
-
-        /// Inserts a value or updates an existing key.
-        /// Returns `error.NoSpace` if the map is full.
-        pub fn put(self: *Self, key: []const u8, value: V) !void {
-            const h = hash(key);
-            var first_tombstone: ?usize = null;
-            var i: usize = 0;
-
-            while (i < CAPACITY) : (i += 1) {
-                const slot = (h + i) & MASK;
-
-                // 1. Found a used slot?
-                if (self.used_mask.isSet(slot)) {
-                    if (self.entries[slot].hash == h) {
-                        self.entries[slot].value = value; // Update existing
-                        return;
-                    }
-                    continue; // Keep looking for the key
-                }
-
-                // 2. Found a tombstone?
-                if (self.tombstone_mask.isSet(slot)) {
-                    if (first_tombstone == null) first_tombstone = slot; // Remember it to reuse
-                    continue; // Keep looking to make sure the key isn't later in the chain
-                }
-
-                // 3. Found a truly empty slot?
-                // If we found a tombstone earlier, use that. Otherwise, use this empty slot.
-                const insert_at = first_tombstone orelse slot;
-                self.entries[insert_at] = .{ .value = value, .hash = h };
-                self.used_mask.set(insert_at);
-                self.tombstone_mask.unset(insert_at); // It's no longer a tombstone
-                return;
-            }
-            return error.NoSpace;
-        }
+        // With Robin Hood + Max Probe, you can often skip tombstones entirely
+        // by shifting elements back on remove (backward shift deletion).
+        max_probe: usize = 0,
 
         /// Retrieves a value by its key. Returns `null` if the key is not found.
         pub fn get(self: Self, key: []const u8) ?V {
             const h = hash(key);
             var i: usize = 0;
-            while (i < CAPACITY) : (i += 1) {
+            // Stop at max_probe instead of CAPACITY
+            while (i <= self.max_probe) : (i += 1) {
                 const slot = (h + i) & MASK;
-                if (!self.used_mask.isSet(slot) and
-                    !self.tombstone_mask.isSet(slot)) return null;
 
-                if (self.used_mask.isSet(slot) and
-                    self.entries[slot].hash == h)
-                {
-                    return self.entries[slot].value;
+                if (!self.used_mask.isSet(slot)) return null;
+
+                // Checking the 'hashes' array is extremely fast/cache-friendly
+                if (self.hashes[slot] == h) {
+                    return self.values[slot];
                 }
             }
             return null;
         }
 
-        fn hash(key: []const u8) u64 {
-            return std.hash.Wyhash.hash(0, key);
+        /// Inserts a value or updates an existing key.
+        /// Returns `error.NoSpace` if the map is full.
+        pub fn put(self: *Self, key: []const u8, value: V) !void {
+            const h = hash(key);
+            var i: usize = 0;
+
+            while (i < CAPACITY) : (i += 1) {
+                const slot = (h + i) & MASK;
+
+                if (self.used_mask.isSet(slot)) {
+                    if (self.hashes[slot] == h) {
+                        self.values[slot] = value;
+                        return;
+                    }
+
+                    // Robin Hood: check if existing element is "richer" (closer to home)
+                    // If so, swap and keep going with the displaced element.
+                    // (Requires storing/calculating PSL - keeping it simple for now)
+                    continue;
+                }
+
+                self.hashes[slot] = h;
+                self.values[slot] = value;
+                self.used_mask.set(slot);
+                self.max_probe = @max(self.max_probe, i);
+                return;
+            }
+            return error.NoSpace;
         }
 
         /// Wipes the map clean, making it empty.
         /// Note: This also clears all tombstones, improving subsequent lookup performance.
         pub fn clear(self: *Self) void {
             self.used_mask = std.StaticBitSet(CAPACITY).initEmpty();
-            self.tombstone_mask = std.StaticBitSet(CAPACITY).initEmpty();
         }
 
         /// Logically removes a key from the map by placing a tombstone.
         pub fn remove(self: *Self, key: []const u8) void {
             const h = hash(key);
             var i: usize = 0;
-            while (i < CAPACITY) : (i += 1) {
+            while (i <= self.max_probe) : (i += 1) {
                 const slot = (h + i) & MASK;
-                // Stop if we hit a truly empty slot (not a tombstone)
-                if (!self.used_mask.isSet(slot) and !self.tombstone_mask.isSet(slot)) return;
+                if (!self.used_mask.isSet(slot)) return; // Key not found
 
-                if (self.used_mask.isSet(slot) and self.entries[slot].hash == h) {
+                if (self.hashes[slot] == h) {
+                    // 1. Clear the target
                     self.used_mask.unset(slot);
-                    self.tombstone_mask.set(slot); // Leave the tombstone
+
+                    // 2. Backward Shift: Move following elements back to fill the gap
+                    var j: usize = 1;
+                    while (true) : (j += 1) {
+                        const curr = (slot + j) & MASK;
+                        const prev = (slot + j - 1) & MASK;
+
+                        if (!self.used_mask.isSet(curr)) break;
+
+                        // Check if the current element is at its "ideal" home.
+                        // If it is, we can't move it back any further.
+                        const ideal = self.hashes[curr] & MASK;
+                        if (curr == ideal) break;
+
+                        // Move it back!
+                        self.hashes[prev] = self.hashes[curr];
+                        self.values[prev] = self.values[curr];
+                        self.used_mask.set(prev);
+                        self.used_mask.unset(curr);
+                    }
                     return;
                 }
             }
+        }
+
+        fn hash(key: []const u8) u64 {
+            return std.hash.Wyhash.hash(0, key);
         }
     };
 }
@@ -143,6 +156,17 @@ test "StaticBufferMap: clear/wipe the map" {
     try expectEqual(null, map.get("data"));
 }
 
+test "StaticBufferMap: overflow error" {
+    var map = StaticBufferMap(i32, 2){};
+
+    try map.put("a", 1);
+    try map.put("b", 2);
+
+    // Attempting to add a 3rd item should fail
+    const result = map.put("c", 3);
+    try std.testing.expectError(error.NoSpace, result);
+}
+
 test "StaticBufferMap: removal with tombstones" {
     // Small capacity to force collisions
     var map = StaticBufferMap(i32, 4){};
@@ -162,15 +186,4 @@ test "StaticBufferMap: removal with tombstones" {
     // 4. Verify we can reuse the tombstone slot
     try map.put("key4", 4);
     try expectEqual(4, map.get("key4"));
-}
-
-test "StaticBufferMap: overflow error" {
-    var map = StaticBufferMap(i32, 2){};
-
-    try map.put("a", 1);
-    try map.put("b", 2);
-
-    // Attempting to add a 3rd item should fail
-    const result = map.put("c", 3);
-    try std.testing.expectError(error.NoSpace, result);
 }
