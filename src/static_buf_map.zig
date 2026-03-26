@@ -12,7 +12,7 @@ const std = @import("std");
 /// A high-performance, allocator-free Hash Map with a fixed capacity.
 /// Uses open addressing with linear probing and tombstones for efficient deletions.
 pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
-    const Entry = struct { key: []const u8, value: V };
+    const Entry = struct { value: V, hash: u64 };
 
     return struct {
         const Self = @This();
@@ -24,16 +24,17 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         /// Inserts a value or updates an existing key.
         /// Returns `error.NoSpace` if the map is full.
         pub fn put(self: *Self, key: []const u8, value: V) !void {
-            const index = self.hash(key);
+            const h = hash(key);
+            const idx = index(h);
             var first_tombstone: ?usize = null;
             var i: usize = 0;
 
             while (i < CAPACITY) : (i += 1) {
-                const slot = (index + i) % CAPACITY;
+                const slot = (idx + i) % CAPACITY;
 
                 // 1. Found a used slot?
                 if (self.used_mask.isSet(slot)) {
-                    if (std.mem.eql(u8, self.entries[slot].key, key)) {
+                    if (self.entries[slot].hash == h) {
                         self.entries[slot].value = value; // Update existing
                         return;
                     }
@@ -49,7 +50,7 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
                 // 3. Found a truly empty slot?
                 // If we found a tombstone earlier, use that. Otherwise, use this empty slot.
                 const insert_at = first_tombstone orelse slot;
-                self.entries[insert_at] = .{ .key = key, .value = value };
+                self.entries[insert_at] = .{ .value = value, .hash = h };
                 self.used_mask.set(insert_at);
                 self.tombstone_mask.unset(insert_at); // It's no longer a tombstone
                 return;
@@ -59,14 +60,16 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
 
         /// Retrieves a value by its key. Returns `null` if the key is not found.
         pub fn get(self: Self, key: []const u8) ?V {
-            const index = self.hash(key);
+            const h = hash(key);
+            const idx = index(h);
             var i: usize = 0;
             while (i < CAPACITY) : (i += 1) {
-                const slot = (index + i) % CAPACITY;
+                const slot = (idx + i) % CAPACITY;
                 if (!self.used_mask.isSet(slot) and
                     !self.tombstone_mask.isSet(slot)) return null;
+
                 if (self.used_mask.isSet(slot) and
-                    std.mem.eql(u8, self.entries[slot].key, key))
+                    self.entries[slot].hash == h)
                 {
                     return self.entries[slot].value;
                 }
@@ -74,9 +77,12 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
             return null;
         }
 
-        fn hash(self: Self, key: []const u8) usize {
-            _ = self;
-            return @truncate(std.hash.Wyhash.hash(0, key) % CAPACITY);
+        fn hash(key: []const u8) u64 {
+            return std.hash.Wyhash.hash(0, key);
+        }
+
+        fn index(hash_val: u64) usize {
+            return @truncate(hash_val % CAPACITY);
         }
 
         /// Wipes the map clean, making it empty.
@@ -88,16 +94,17 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
 
         /// Logically removes a key from the map by placing a tombstone.
         pub fn remove(self: *Self, key: []const u8) void {
-            const index = self.hash(key);
+            const h = hash(key);
+            const idx = index(h);
             var i: usize = 0;
             while (i < CAPACITY) : (i += 1) {
-                const slot = (index + i) % CAPACITY;
+                const slot = (idx + i) % CAPACITY;
                 // Stop if we hit a truly empty slot (not a tombstone)
                 if (!self.used_mask.isSet(slot) and !self.tombstone_mask.isSet(slot)) return;
 
-                if (self.used_mask.isSet(slot) and std.mem.eql(u8, self.entries[slot].key, key)) {
+                if (self.used_mask.isSet(slot) and self.entries[slot].hash == h) {
                     self.used_mask.unset(slot);
-                    self.tombstone_mask.set(slot); // Leave the tombstone 🪦
+                    self.tombstone_mask.set(slot); // Leave the tombstone
                     return;
                 }
             }
