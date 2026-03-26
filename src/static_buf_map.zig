@@ -12,10 +12,16 @@ const std = @import("std");
 /// A high-performance, allocator-free Hash Map with a fixed capacity.
 /// Uses open addressing with linear probing and tombstones for efficient deletions.
 pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
+    comptime {
+        if (CAPACITY == 0 or (CAPACITY & (CAPACITY - 1)) != 0)
+            @compileError("CAPACITY must be a power of 2");
+    }
+
     const Entry = struct { value: V, hash: u64 };
 
     return struct {
         const Self = @This();
+        const MASK = CAPACITY - 1;
 
         entries: [CAPACITY]Entry = undefined,
         used_mask: std.StaticBitSet(CAPACITY) = .initEmpty(),
@@ -25,12 +31,11 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         /// Returns `error.NoSpace` if the map is full.
         pub fn put(self: *Self, key: []const u8, value: V) !void {
             const h = hash(key);
-            const idx = index(h);
             var first_tombstone: ?usize = null;
             var i: usize = 0;
 
             while (i < CAPACITY) : (i += 1) {
-                const slot = (idx + i) % CAPACITY;
+                const slot = (h + i) & MASK;
 
                 // 1. Found a used slot?
                 if (self.used_mask.isSet(slot)) {
@@ -61,10 +66,9 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         /// Retrieves a value by its key. Returns `null` if the key is not found.
         pub fn get(self: Self, key: []const u8) ?V {
             const h = hash(key);
-            const idx = index(h);
             var i: usize = 0;
             while (i < CAPACITY) : (i += 1) {
-                const slot = (idx + i) % CAPACITY;
+                const slot = (h + i) & MASK;
                 if (!self.used_mask.isSet(slot) and
                     !self.tombstone_mask.isSet(slot)) return null;
 
@@ -81,10 +85,6 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
             return std.hash.Wyhash.hash(0, key);
         }
 
-        fn index(hash_val: u64) usize {
-            return @truncate(hash_val % CAPACITY);
-        }
-
         /// Wipes the map clean, making it empty.
         /// Note: This also clears all tombstones, improving subsequent lookup performance.
         pub fn clear(self: *Self) void {
@@ -95,10 +95,9 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         /// Logically removes a key from the map by placing a tombstone.
         pub fn remove(self: *Self, key: []const u8) void {
             const h = hash(key);
-            const idx = index(h);
             var i: usize = 0;
             while (i < CAPACITY) : (i += 1) {
-                const slot = (idx + i) % CAPACITY;
+                const slot = (h + i) & MASK;
                 // Stop if we hit a truly empty slot (not a tombstone)
                 if (!self.used_mask.isSet(slot) and !self.tombstone_mask.isSet(slot)) return;
 
@@ -116,7 +115,7 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
 test "StaticBufferMap: basic put and get" {
-    var map = StaticBufferMap(i32, 10){};
+    var map = StaticBufferMap(i32, 8){};
 
     try map.put("apple", 100);
     try map.put("banana", 200);
@@ -127,7 +126,7 @@ test "StaticBufferMap: basic put and get" {
 }
 
 test "StaticBufferMap: overwrite existing key" {
-    var map = StaticBufferMap(i32, 5){};
+    var map = StaticBufferMap(i32, 8){};
 
     try map.put("test", 1);
     try map.put("test", 2); // Should update
@@ -136,7 +135,7 @@ test "StaticBufferMap: overwrite existing key" {
 }
 
 test "StaticBufferMap: clear/wipe the map" {
-    var map = StaticBufferMap(i32, 10){};
+    var map = StaticBufferMap(i32, 8){};
 
     try map.put("data", 500);
     map.clear(); // Resets the bitset
