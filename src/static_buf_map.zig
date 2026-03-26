@@ -27,16 +27,15 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         max_probe: usize = 0,
 
         /// Retrieves a value by its key. Returns `null` if the key is not found.
-        pub fn get(self: Self, key: []const u8) ?V {
-            const h = hash(key);
+        pub fn get(self: Self, key: u64) ?V {
             var i: usize = 0;
             // Stop at max_probe instead of CAPACITY
             while (i <= self.max_probe) : (i += 1) {
-                const slot = (h + i) & MASK;
+                const slot = (key + i) & MASK;
 
                 if (!self.used_mask.isSet(slot)) return null;
 
-                if (self.hashes[slot] == h) {
+                if (self.hashes[slot] == key) {
                     return self.values[slot];
                 }
             }
@@ -45,15 +44,14 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
 
         /// Inserts a value or updates an existing key.
         /// Returns `error.NoSpace` if the map is full.
-        pub fn put(self: *Self, key: []const u8, value: V) !void {
-            const h = hash(key);
+        pub fn put(self: *Self, key: u64, value: V) !void {
             var i: usize = 0;
 
             while (i < CAPACITY) : (i += 1) {
-                const slot = (h + i) & MASK;
+                const slot = (key + i) & MASK;
 
                 if (self.used_mask.isSet(slot)) {
-                    if (self.hashes[slot] == h) {
+                    if (self.hashes[slot] == key) {
                         self.values[slot] = value;
                         return;
                     }
@@ -63,7 +61,7 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
                     continue;
                 }
 
-                self.hashes[slot] = h;
+                self.hashes[slot] = key;
                 self.values[slot] = value;
                 self.used_mask.set(slot);
                 self.max_probe = @max(self.max_probe, i);
@@ -77,15 +75,14 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
             self.used_mask = std.StaticBitSet(CAPACITY).initEmpty();
         }
 
-        /// Removes a key from the map 
-        pub fn remove(self: *Self, key: []const u8) void {
-            const h = hash(key);
+        /// Removes a key from the map
+        pub fn remove(self: *Self, key: u64) void {
             var i: usize = 0;
             while (i <= self.max_probe) : (i += 1) {
-                const slot = (h + i) & MASK;
+                const slot = (key + i) & MASK;
                 if (!self.used_mask.isSet(slot)) return; // Key not found
 
-                if (self.hashes[slot] == h) {
+                if (self.hashes[slot] == key) {
                     // 1. Clear the target
                     self.used_mask.unset(slot);
 
@@ -112,73 +109,76 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
                 }
             }
         }
-
-        fn hash(key: []const u8) u64 {
-            return std.hash.Wyhash.hash(0, key);
-        }
     };
 }
 
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
+fn hash(key: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, key);
+}
+
 test "StaticBufferMap: basic put and get" {
     var map = StaticBufferMap(i32, 8){};
 
-    try map.put("apple", 100);
-    try map.put("banana", 200);
+    const key1 = hash("apple");
+    const key2 = hash("bannana");
 
-    try expectEqual(100, map.get("apple"));
-    try expectEqual(200, map.get("banana"));
-    try expectEqual(null, map.get("cherry"));
+    try map.put(key1, 100);
+    try map.put(key2, 200);
+
+    try expectEqual(100, map.get(key1));
+    try expectEqual(200, map.get(key2));
+    try expectEqual(null, map.get(hash("cherry")));
 }
 
 test "StaticBufferMap: overwrite existing key" {
     var map = StaticBufferMap(i32, 8){};
 
-    try map.put("test", 1);
-    try map.put("test", 2); // Should update
+    try map.put(hash("test"), 1);
+    try map.put(hash("test"), 2); // Should update
 
-    try expectEqual(2, map.get("test"));
+    try expectEqual(2, map.get(hash("test")));
 }
 
 test "StaticBufferMap: clear/wipe the map" {
     var map = StaticBufferMap(i32, 8){};
 
-    try map.put("data", 500);
+    try map.put(hash("data"), 500);
     map.clear(); // Resets the bitset
 
-    try expectEqual(null, map.get("data"));
+    try expectEqual(null, map.get(hash("data")));
 }
 
 test "StaticBufferMap: overflow error" {
     var map = StaticBufferMap(i32, 2){};
 
-    try map.put("a", 1);
-    try map.put("b", 2);
+    try map.put(1, 1);
+    try map.put(2, 2);
 
     // Attempting to add a 3rd item should fail
-    const result = map.put("c", 3);
+    const result = map.put(3, 3);
     try std.testing.expectError(error.NoSpace, result);
 }
 
-test "StaticBufferMap: removal with tombstones" {
+test "StaticBufferMap: removal" {
     // Small capacity to force collisions
     var map = StaticBufferMap(i32, 4){};
 
     // 1. Fill enough to potentially cause a collision chain
-    try map.put("key1", 1);
-    try map.put("key2", 2);
-    try map.put("key3", 3);
+    try map.put(1, 1);
+    try map.put(2, 2);
+    try map.put(3, 3);
 
     // 2. Remove the middle element
-    map.remove("key2");
+    map.remove(2);
 
     // 3. Verify 'key2' is gone but 'key3' is still reachable (chain is not broken)
-    try expectEqual(null, map.get("key2"));
-    try expectEqual(3, map.get("key3"));
+    try expectEqual(null, map.get(2));
+    try expectEqual(3, map.get(3));
 
     // 4. Verify we can reuse the tombstone slot
-    try map.put("key4", 4);
-    try expectEqual(4, map.get("key4"));
+    try map.put(4, 4);
+    try expectEqual(4, map.get(4));
 }
