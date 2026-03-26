@@ -24,8 +24,6 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         hashes: [CAPACITY]u64 = undefined,
         values: [CAPACITY]V = undefined,
         used_mask: std.StaticBitSet(CAPACITY) = .initEmpty(),
-        // With Robin Hood + Max Probe, you can often skip tombstones entirely
-        // by shifting elements back on remove (backward shift deletion).
         max_probe: usize = 0,
 
         /// Retrieves a value by its key. Returns `null` if the key is not found.
@@ -38,7 +36,6 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
 
                 if (!self.used_mask.isSet(slot)) return null;
 
-                // Checking the 'hashes' array is extremely fast/cache-friendly
                 if (self.hashes[slot] == h) {
                     return self.values[slot];
                 }
@@ -63,7 +60,6 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
 
                     // Robin Hood: check if existing element is "richer" (closer to home)
                     // If so, swap and keep going with the displaced element.
-                    // (Requires storing/calculating PSL - keeping it simple for now)
                     continue;
                 }
 
@@ -77,12 +73,11 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         }
 
         /// Wipes the map clean, making it empty.
-        /// Note: This also clears all tombstones, improving subsequent lookup performance.
         pub fn clear(self: *Self) void {
             self.used_mask = std.StaticBitSet(CAPACITY).initEmpty();
         }
 
-        /// Logically removes a key from the map by placing a tombstone.
+        /// Removes a key from the map 
         pub fn remove(self: *Self, key: []const u8) void {
             const h = hash(key);
             var i: usize = 0;
