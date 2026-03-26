@@ -20,24 +20,28 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
     return struct {
         const Self = @This();
         const MASK = CAPACITY - 1;
+        const MAX_PROBE = 8; // UI performance sweet spot
 
-        hashes: [CAPACITY]u64 = undefined,
-        values: [CAPACITY]V = undefined,
-        used_mask: std.StaticBitSet(CAPACITY) = .initEmpty(),
-        max_probe: usize = 0,
+        const Entry = struct {
+            hash: u64 = 0,
+            value: V = undefined,
+        };
+
+        entries: [CAPACITY]Entry = [_]Entry{.{}} ** CAPACITY,
 
         /// Retrieves a value by its key. Returns `null` if the key is not found.
-        pub fn get(self: Self, key: u64) ?V {
+        pub fn get(self: *const Self, key: u64) ?V {
+            // Ensure key is never 0 (sentinel for empty)
+            const h = if (key == 0) 1 else key;
+            const start_slot = h & MASK;
+
             var i: usize = 0;
-            // Stop at max_probe instead of CAPACITY
-            while (i <= self.max_probe) : (i += 1) {
-                const slot = (key + i) & MASK;
+            while (i < MAX_PROBE) : (i += 1) {
+                const slot = (start_slot + i) & MASK;
+                const entry = self.entries[slot];
 
-                if (!self.used_mask.isSet(slot)) return null;
-
-                if (self.hashes[slot] == key) {
-                    return self.values[slot];
-                }
+                if (entry.hash == h) return entry.value;
+                if (entry.hash == 0) return null; // Hit an empty slot, stop searching
             }
             return null;
         }
@@ -45,80 +49,44 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         /// Inserts a value or updates an existing key.
         /// Returns `error.NoSpace` if the map is full.
         pub fn put(self: *Self, key: u64, value: V) !void {
-            var curr_key = key;
-            var curr_val = value;
+            const h = if (key == 0) 1 else key;
+            const start_slot = h & MASK;
+
             var i: usize = 0;
+            while (i < MAX_PROBE) : (i += 1) {
+                const slot = (start_slot + i) & MASK;
 
-            while (i < CAPACITY) : (i += 1) {
-                const slot = (curr_key + i) & MASK;
-
-                if (self.used_mask.isSet(slot)) {
-                    if (self.hashes[slot] == curr_key) {
-                        self.values[slot] = curr_val;
-                        return;
-                    }
-
-                    // Robin Hood Swap
-                    // Calculate how far the current occupant is from its home
-                    const occupied_ideal = self.hashes[slot] & MASK;
-                    const occupied_distance = (slot + CAPACITY - occupied_ideal) & MASK;
-
-                    if (i > occupied_distance) {
-                        // The incoming item is "poorer" (further from home). Swap!
-                        std.mem.swap(u64, &self.hashes[slot], &curr_key);
-                        std.mem.swap(V, &self.values[slot], &curr_val);
-                        // After swapping, 'i' must reflect the distance of the NEW curr_key
-                        i = occupied_distance;
-                    }
-                    continue;
+                // Overwrite if same key OR slot is empty
+                if (self.entries[slot].hash == h or self.entries[slot].hash == 0) {
+                    self.entries[slot] = .{ .hash = h, .value = value };
+                    return;
                 }
-
-                self.hashes[slot] = curr_key;
-                self.values[slot] = curr_val;
-                self.used_mask.set(slot);
-                self.max_probe = @max(self.max_probe, i);
-                return;
             }
+            // Map is too crowded at this hash location
             return error.NoSpace;
         }
 
         /// Wipes the map clean, making it empty.
         pub fn clear(self: *Self) void {
-            self.used_mask = std.StaticBitSet(CAPACITY).initEmpty();
+            // Only zeroing the hashes is enough to "reset" the map
+            for (&self.entries) |*entry| {
+                entry.hash = 0;
+            }
         }
 
         /// Removes a key from the map
         pub fn remove(self: *Self, key: u64) void {
+            const h = if (key == 0) 1 else key;
+            const start_slot = h & MASK;
+
             var i: usize = 0;
-            while (i <= self.max_probe) : (i += 1) {
-                const slot = (key + i) & MASK;
-                if (!self.used_mask.isSet(slot)) return; // Key not found
-
-                if (self.hashes[slot] == key) {
-                    // 1. Clear the target
-                    self.used_mask.unset(slot);
-
-                    // 2. Backward Shift: Move following elements back to fill the gap
-                    var j: usize = 1;
-                    while (true) : (j += 1) {
-                        const curr = (slot + j) & MASK;
-                        const prev = (slot + j - 1) & MASK;
-
-                        if (!self.used_mask.isSet(curr)) break;
-
-                        // Check if the current element is at its "ideal" home.
-                        // If it is, we can't move it back any further.
-                        const ideal = self.hashes[curr] & MASK;
-                        if (curr == ideal) break;
-
-                        // Move it back!
-                        self.hashes[prev] = self.hashes[curr];
-                        self.values[prev] = self.values[curr];
-                        self.used_mask.set(prev);
-                        self.used_mask.unset(curr);
-                    }
+            while (i < MAX_PROBE) : (i += 1) {
+                const slot = (start_slot + i) & MASK;
+                if (self.entries[slot].hash == h) {
+                    self.entries[slot].hash = 0;
                     return;
                 }
+                if (self.entries[slot].hash == 0) return;
             }
         }
     };
@@ -193,4 +161,60 @@ test "StaticBufferMap: removal" {
     // 4. Verify we can reuse the tombstone slot
     try map.put(4, 4);
     try expectEqual(4, map.get(4));
+}
+
+test "StaticBufferMap: performance benchmark" {
+    const CAPACITY = 65536;
+    const FILL_COUNT = 45000;
+    var map = StaticBufferMap(u64, CAPACITY){};
+
+    var timer = try std.time.Timer.start();
+
+    // Benchmark PUT
+    timer.reset();
+    for (0..FILL_COUNT) |i| {
+        try map.put(i, i);
+    }
+    const put_total = timer.read();
+
+    // Benchmark GET
+    timer.reset();
+    var sink: u64 = 0;
+    for (0..FILL_COUNT) |i| {
+        sink += map.get(i).?;
+    }
+    const get_total = timer.read();
+
+    // Ensure the compiler doesn't optimize away the GET loop
+    std.mem.doNotOptimizeAway(sink);
+
+    // Benchmark REMOVE
+    timer.reset();
+    for (0..FILL_COUNT) |i| {
+        map.remove(i);
+    }
+    const remove_total = timer.read();
+
+    const put_ns = @as(f64, @floatFromInt(put_total)) / FILL_COUNT;
+    const get_ns = @as(f64, @floatFromInt(get_total)) / FILL_COUNT;
+    const remove_ns = @as(f64, @floatFromInt(remove_total)) / FILL_COUNT;
+
+    // Convert to Million Operations Per Second (MOPS)
+    const put_mops = 1000.0 / put_ns;
+    const get_mops = 1000.0 / get_ns;
+    const remove_mops = 1000.0 / remove_ns;
+
+    std.debug.print("\n📊 BENCHMARK: {d} items @ CAPACITY {d}\n", .{ FILL_COUNT, CAPACITY });
+    std.debug.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
+    
+    std.debug.print("PUT:    {d: >6.2} M ops/sec  |  {d: >7.2} ns/op  |  ({d: >4.1} ms total)\n", 
+        .{ put_mops, put_ns, @as(f64, @floatFromInt(put_total)) / 1_000_000.0 });
+        
+    std.debug.print("GET:    {d: >6.2} M ops/sec  |  {d: >7.2} ns/op  |  ({d: >4.1} ms total)\n", 
+        .{ get_mops, get_ns, @as(f64, @floatFromInt(get_total)) / 1_000_000.0 });
+        
+    std.debug.print("REMOVE: {d: >6.2} M ops/sec  |  {d: >7.2} ns/op  |  ({d: >4.1} ms total)\n", 
+        .{ remove_mops, remove_ns, @as(f64, @floatFromInt(remove_total)) / 1_000_000.0 });
+        
+    std.debug.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
 }
