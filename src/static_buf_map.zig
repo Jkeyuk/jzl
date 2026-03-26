@@ -45,24 +45,36 @@ pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
         /// Inserts a value or updates an existing key.
         /// Returns `error.NoSpace` if the map is full.
         pub fn put(self: *Self, key: u64, value: V) !void {
+            var curr_key = key;
+            var curr_val = value;
             var i: usize = 0;
 
             while (i < CAPACITY) : (i += 1) {
-                const slot = (key + i) & MASK;
+                const slot = (curr_key + i) & MASK;
 
                 if (self.used_mask.isSet(slot)) {
-                    if (self.hashes[slot] == key) {
-                        self.values[slot] = value;
+                    if (self.hashes[slot] == curr_key) {
+                        self.values[slot] = curr_val;
                         return;
                     }
 
-                    // Robin Hood: check if existing element is "richer" (closer to home)
-                    // If so, swap and keep going with the displaced element.
+                    // Robin Hood Swap
+                    // Calculate how far the current occupant is from its home
+                    const occupied_ideal = self.hashes[slot] & MASK;
+                    const occupied_distance = (slot + CAPACITY - occupied_ideal) & MASK;
+
+                    if (i > occupied_distance) {
+                        // The incoming item is "poorer" (further from home). Swap!
+                        std.mem.swap(u64, &self.hashes[slot], &curr_key);
+                        std.mem.swap(V, &self.values[slot], &curr_val);
+                        // After swapping, 'i' must reflect the distance of the NEW curr_key
+                        i = occupied_distance;
+                    }
                     continue;
                 }
 
-                self.hashes[slot] = key;
-                self.values[slot] = value;
+                self.hashes[slot] = curr_key;
+                self.values[slot] = curr_val;
                 self.used_mask.set(slot);
                 self.max_probe = @max(self.max_probe, i);
                 return;
