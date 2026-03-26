@@ -11,6 +11,7 @@ const std = @import("std");
 
 /// A high-performance, allocator-free Hash Map with a fixed capacity.
 /// Uses open addressing with linear probing and tombstones for efficient deletions.
+/// CAPACITY must be a power of 2
 pub fn StaticBufferMap(comptime V: type, comptime CAPACITY: usize) type {
     comptime {
         if (CAPACITY == 0 or (CAPACITY & (CAPACITY - 1)) != 0)
